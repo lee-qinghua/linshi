@@ -3,23 +3,32 @@ package com.atguigu.gmall.realtime.app.dws;
 import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONObject;
 import com.atguigu.gmall.realtime.bean.VisitorStats;
+import com.atguigu.gmall.realtime.utils.ClickHouseUtil;
 import com.atguigu.gmall.realtime.utils.MyKafkaUtil;
 import org.apache.flink.api.common.eventtime.SerializableTimestampAssigner;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.MapFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.java.functions.KeySelector;
+import org.apache.flink.api.java.tuple.Tuple4;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.ProcessFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.streaming.connectors.kafka.FlinkKafkaConsumer;
 import org.apache.flink.util.Collector;
 
+import java.text.SimpleDateFormat;
 import java.time.Duration;
+import java.util.Date;
 
 public class VisterStateApp {
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         //TODO 1.基本环境准备
         //1.1 设置流式处理环境
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -164,7 +173,7 @@ public class VisterStateApp {
         DataStream<VisitorStats> unionDS = pvStatsDS.union(uvStatsDS, svStatsDS, userJumpStatsDS);
 
         // TODO 5. 设置水位线
-        unionDS.assignTimestampsAndWatermarks(
+        DataStream<VisitorStats> stream = unionDS.assignTimestampsAndWatermarks(
                 WatermarkStrategy.<VisitorStats>forBoundedOutOfOrderness(Duration.ofSeconds(3))
                         .withTimestampAssigner(new SerializableTimestampAssigner<VisitorStats>() {
                             @Override
@@ -172,8 +181,48 @@ public class VisterStateApp {
                                 return visitorStats.getTs();
                             }
                         }))
-                .keyBy(new KeySelector<VisitorStats0, Object>() {
+                .keyBy(new KeySelector<VisitorStats, Tuple4<String, String, String, String>>() {
+                    @Override
+                    public Tuple4<String, String, String, String> getKey(VisitorStats visitorStats) throws Exception {
+                        return Tuple4.of(
+                                visitorStats.getAr(),
+                                visitorStats.getCh(),
+                                visitorStats.getVc(),
+                                visitorStats.getIs_new()
+                        );
+                    }
                 })
+                .window(TumblingEventTimeWindows.of(Time.seconds(10)))
+                .reduce(new ReduceFunction<VisitorStats>() {    // 因为我最后需要的结果也是这个类型，只是把各个数值加起来
+                    @Override
+                    public VisitorStats reduce(VisitorStats stats1, VisitorStats stats2) throws Exception {
+                        stats1.setPv_ct(stats1.getPv_ct() + stats2.getPv_ct());
+                        stats1.setUv_ct(stats1.getUv_ct() + stats2.getUv_ct());
+                        stats1.setSv_ct(stats1.getSv_ct() + stats2.getSv_ct());
+                        stats1.setDur_sum(stats1.getDur_sum() + stats2.getDur_sum());
+                        return stats1;
+                    }
+                }, new ProcessWindowFunction<VisitorStats, VisitorStats, Tuple4<String, String, String, String>, TimeWindow>() {
+                    @Override
+                    public void process(Tuple4<String, String, String, String> key, Context context, Iterable<VisitorStats> elements, Collector<VisitorStats> out) throws Exception {
+                        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+                        for (VisitorStats visitorStats : elements) {
+                            //获取窗口的开始时间
+                            String startDate = sdf.format(new Date(context.window().getStart()));
+                            //获取窗口的结束时间
+                            String endDate = sdf.format(new Date(context.window().getEnd()));
+                            visitorStats.setStt(startDate);
+                            visitorStats.setEdt(endDate);
+                            visitorStats.setTs(new Date().getTime());
+                            out.collect(visitorStats);
+                        }
+                    }
+                });
 
+        // todo 输出
+        // 实体类要和表中字段的名称顺序一致
+        stream.addSink(ClickHouseUtil.getSink("insert into xx_table values(?,?,?,?,?,?,?)"));
+
+        env.execute();
     }
 }
